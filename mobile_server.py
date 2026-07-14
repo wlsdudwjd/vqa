@@ -14,16 +14,20 @@ browser:
 (this machine's LAN IP can be found with `ip -4 addr show`)
 """
 
+import asyncio
 import base64
+import io
+import json
 import os
 import tempfile
+from collections import deque
 
 import cv2
 import numpy as np
 import torch
 import uvicorn
-from fastapi import FastAPI, Form, UploadFile
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi import FastAPI, Form, Request, UploadFile
+from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from PIL import Image
 from transformers import (AutoProcessor, BitsAndBytesConfig,
                            Qwen2_5_VLForConditionalGeneration)
@@ -31,9 +35,23 @@ from transformers import (AutoProcessor, BitsAndBytesConfig,
 VLM_MODEL_ID = 'Qwen/Qwen2.5-VL-7B-Instruct'
 MAX_FRAMES = 8
 
+# --- Live (SSE) session settings ---
+# How often the /live/{id}/events stream re-runs inference on the latest
+# buffered frames while a live session is active.
+LIVE_INFER_INTERVAL_SECONDS = 2.0
+
 app = FastAPI()
 processor = None
 model = None
+
+# Every call into the VLM (both /ask and /live) is serialized through this
+# lock so concurrent requests don't fight over the same GPU/model at once.
+vlm_lock = asyncio.Lock()
+
+# session_id -> rolling buffer of the most recent uploaded frames (RGB numpy
+# arrays). Populated by POST /live/{id}/frame, consumed by GET
+# /live/{id}/events.
+live_sessions: dict[str, deque] = {}
 
 
 @app.on_event('startup')
@@ -104,10 +122,65 @@ async def ask(video: UploadFile, question: str = Form(...)):
     if not frames:
       return JSONResponse(
           {'error': '영상에서 프레임을 추출하지 못했습니다.'}, status_code=400)
-    answer = ask_vlm(frames, question)
+    async with vlm_lock:
+      answer = await asyncio.get_event_loop().run_in_executor(
+          None, ask_vlm, frames, question)
     return {'answer': answer, 'num_frames': len(frames)}
   finally:
     os.remove(tmp_path)
+
+
+# =============================================================================
+# Live analysis (SSE): the phone streams JPEG frames continuously via POST
+# while a single long-lived GET holds an event-stream connection open and
+# pushes a fresh answer every LIVE_INFER_INTERVAL_SECONDS. See
+# robovqa_live/lib/live_page.dart for the client side of this protocol.
+# =============================================================================
+
+@app.post('/live/{session_id}/frame')
+async def live_frame(session_id: str, frame: UploadFile):
+  data = await frame.read()
+  image = Image.open(io.BytesIO(data)).convert('RGB')
+  buffer = live_sessions.setdefault(session_id, deque(maxlen=MAX_FRAMES))
+  buffer.append(np.array(image))
+  return Response(status_code=204)
+
+
+@app.get('/live/{session_id}/events')
+async def live_events(session_id: str, request: Request, question: str):
+  buffer = live_sessions.setdefault(session_id, deque(maxlen=MAX_FRAMES))
+
+  async def event_stream():
+    try:
+      while True:
+        if await request.is_disconnected():
+          break
+        if buffer:
+          frames = list(buffer)
+          try:
+            async with vlm_lock:
+              answer = await asyncio.get_event_loop().run_in_executor(
+                  None, ask_vlm, frames, question)
+            payload = json.dumps({'answer': answer, 'num_frames': len(frames)})
+            yield f'data: {payload}\n\n'
+          except Exception as e:
+            payload = json.dumps({'message': str(e)})
+            yield f'event: error\ndata: {payload}\n\n'
+        await asyncio.sleep(LIVE_INFER_INTERVAL_SECONDS)
+    finally:
+      live_sessions.pop(session_id, None)
+
+  return StreamingResponse(
+      event_stream(),
+      media_type='text/event-stream',
+      headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'},
+  )
+
+
+@app.delete('/live/{session_id}')
+async def live_delete(session_id: str):
+  live_sessions.pop(session_id, None)
+  return Response(status_code=204)
 
 
 @app.get('/', response_class=HTMLResponse)
