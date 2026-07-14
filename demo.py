@@ -1,26 +1,3 @@
-"""Standalone RoboVQA demo - everything in a single file.
-
-Browse random episodes from the (locally downloaded) val split and ask a
-real VLM free-form questions about what's happening in the video, alongside
-the dataset's own ground-truth QA pairs for that episode.
-
-Run with:
-    .venv/bin/python demo.py
-Then open the printed http://127.0.0.1:7860 URL in a browser.
-
-Internally this file plays two roles depending on how it's invoked:
-  - `python demo.py`              -> runs the Gradio app (imports tensorflow)
-  - `python demo.py --vlm-worker` -> runs the VLM inference loop (imports
-                                      torch/transformers)
-These two roles MUST run in separate processes: importing torch/transformers
-in the same process as tensorflow reliably segfaults here (confirmed even
-with the CPU-only TF build - the two frameworks' bundled native CUDA/cuDNN
-libraries conflict). The Gradio process therefore re-launches this same
-file as a subprocess with --vlm-worker and talks to it over stdin/stdout
-using newline-delimited JSON, keeping the model loaded for the whole
-session instead of reloading it per request.
-"""
-
 import argparse
 import base64
 import io
@@ -35,11 +12,6 @@ DATA_DIR = os.environ.get('ROBOVQA_DATA_DIR', os.path.dirname(os.path.abspath(__
 TFRECORD_DIR = os.path.join(DATA_DIR, 'tfrecord')
 GIF_PATH = '/tmp/robovqa_demo_episode.gif'
 VLM_MODEL_ID = 'Qwen/Qwen2.5-VL-7B-Instruct'
-
-
-# =============================================================================
-# VLM worker: runs in its own process, only ever imports torch/transformers.
-# =============================================================================
 
 def run_vlm_worker():
   import torch
@@ -84,12 +56,7 @@ def run_vlm_worker():
     print(json.dumps({'answer': answer}), flush=True)
 
 
-# =============================================================================
-# VLM client: used by the Gradio process to talk to the worker subprocess.
-# =============================================================================
-
 def launch_vlm_worker():
-  """Starts this same file as a `--vlm-worker` subprocess, waits for READY."""
   proc = subprocess.Popen(
       [sys.executable, os.path.abspath(__file__), '--vlm-worker'],
       stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -132,11 +99,6 @@ def ask_vlm(proc, images, question, max_frames=8, max_new_tokens=128):
     raise RuntimeError('vlm_worker died:\n' + proc.stderr.read())
   return json.loads(response_line)['answer']
 
-
-# =============================================================================
-# RoboVQA text parsing: turns a raw episode text blob into (question, answer)
-# pairs. RoboVQA packs many QA turns into one string using <task:...> tags.
-# =============================================================================
 
 class Task:
   """A class for handling tags and splits in a given task."""
@@ -193,8 +155,6 @@ class Task:
 
 
 class Tasks:
-  """A class for handling and holding tasks information."""
-
   TASK_RE = r'(<task[:\w]*>)'
   RE_FLAGS = re.IGNORECASE
 
@@ -214,7 +174,6 @@ class Tasks:
 
 
 def fetch_question_answer(text):
-  """Returns a list of (index, task_type, question, answer) for an episode."""
   tasks = Tasks(text)
   results = []
   for i, (task_type, task_list) in enumerate(tasks.tasks_dict.items()):
@@ -223,19 +182,11 @@ def fetch_question_answer(text):
         results.append((i, task_type, question.strip(), answer.strip()))
   return results
 
-
-# =============================================================================
-# Gradio app: runs in the main process, only ever imports tensorflow (for
-# reading tfrecords) - never torch.
-# =============================================================================
-
 def run_gradio_app():
   import gradio as gr
   import tensorflow as tf
   from PIL import Image
 
-  # TF is only used to read/decode tfrecords; keep it off the GPU so the VLM
-  # worker subprocess has the full VRAM to itself.
   tf.config.set_visible_devices([], 'GPU')
 
   print('Loading val episodes into memory...')
@@ -283,8 +234,6 @@ def run_gradio_app():
   with gr.Blocks(title='RoboVQA Demo') as demo:
     gr.Markdown(
         '# RoboVQA 데모\n'
-        '랜덤 에피소드를 불러온 뒤, 데이터셋의 정답 QA를 참고하거나 '
-        '직접 자유롭게 질문해서 로컬 VLM(Qwen2.5-VL-7B)의 답을 확인해보세요.'
     )
 
     episode_images = gr.State([])
